@@ -1,0 +1,16 @@
+{
+  // The entry runs directly under Node's type stripping: erasable TypeScript only,
+  // no build step, no emitted files. These options describe that to an editor/checker.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["*.ts", "lib/*.ts"]
+}
