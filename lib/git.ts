@@ -194,8 +194,36 @@ interface RawPackEntry {
  * Inflate the zlib stream at the front of `buf`, returning the payload and the number of compressed
  * bytes it occupied. Node's inflateSync tolerates trailing bytes, so the consumed length is the
  * smallest prefix that inflates to exactly `expectedSize` bytes.
+ *
+ * Fast path: one inflateSync with { info: true }; the returned engine's bytesWritten is exactly the
+ * number of input bytes the stream consumed (verified against deflateSync output of many sizes).
+ * The result is validated (payload size, consumed within the buffer) and any doubt falls back to
+ * the prefix search below, so a Node whose engine does not report consumption stays correct.
  */
 function inflatePrefix(buf: Buffer, expectedSize: number): { data: Buffer; consumed: number } {
+  try {
+    const result = inflateSync(buf, { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten?: unknown };
+    };
+    const consumed = result.engine?.bytesWritten;
+    if (
+      result.buffer.length === expectedSize &&
+      typeof consumed === 'number' &&
+      Number.isInteger(consumed) &&
+      consumed > 0 &&
+      consumed <= buf.length
+    ) {
+      return { data: result.buffer, consumed };
+    }
+  } catch {
+    // A truncated or corrupt stream throws here exactly as in the search below; fall through.
+  }
+  return inflatePrefixBySearch(buf, expectedSize);
+}
+
+/** The original prefix search: binary-search the smallest prefix that inflates to the payload. */
+function inflatePrefixBySearch(buf: Buffer, expectedSize: number): { data: Buffer; consumed: number } {
   let lo = 1;
   let hi = buf.length;
   let best: Buffer | null = null;
