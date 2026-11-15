@@ -70,6 +70,7 @@ export interface Repo {
   description: string;
   readonly defaultBranch: string;
   refs: Map<string, string>;
+  refsVersion: number; // bumped on every refs mutation; lets the HTTP layer cache ref-derived replies
   labels: Map<string, { name: string; color: string }>;
   issues: Map<number, Issue>;
   pulls: Map<number, Pull>;
@@ -80,6 +81,7 @@ export interface Repo {
 
 export class Forge {
   readonly store = new ObjectStore();
+  objectsVersion = 0; // bumped whenever a received pack stores objects; see githttp's caches
   readonly repos = new Map<string, Repo>();
   private repoSeq = 5000;
   private clockTick = 0;
@@ -88,7 +90,7 @@ export class Forge {
   /** A logical timestamp: fixed base plus one second per call, as an ISO string. */
   nowIso(): string {
     this.clockTick += 1;
-    return new Date((CLOCK_BASE_SEC + this.clockTick) * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    return isoFromEpochSec(CLOCK_BASE_SEC + this.clockTick);
   }
 
   /** A git author/committer line for API-created commits, on the logical clock. */
@@ -117,6 +119,7 @@ export class Forge {
       description,
       defaultBranch: 'main',
       refs: new Map(),
+      refsVersion: 0,
       labels: new Map(),
       issues: new Map(),
       pulls: new Map(),
@@ -310,6 +313,7 @@ export class Forge {
     const treeSha = this.buildTree(files);
     const commitSha = this.makeCommit(treeSha, tip ?? null, message);
     repo.refs.set(`refs/heads/${branch}`, commitSha);
+    repo.refsVersion += 1;
     return { commitSha, blobShas };
   }
 
@@ -369,6 +373,7 @@ export class Forge {
       commitSha = this.makeCommit(treeSha, currentBaseTip, `${pull.title} (#${pull.number})\n`);
     }
     repo.refs.set(`refs/heads/${pull.baseRef}`, commitSha);
+    repo.refsVersion += 1;
     pull.state = 'closed';
     pull.merged = true;
     pull.mergeCommitSha = commitSha;
@@ -497,6 +502,33 @@ export function lineDiff(a: readonly string[], b: readonly string[]): { addition
   }
   const common = dp[0] as number;
   return { additions: m - common, deletions: n - common };
+}
+
+/**
+ * Format epoch seconds as an ISO-8601 UTC string at seconds precision, arithmetically (civil
+ * date from the day count, after Howard Hinnant's algorithm). Byte-identical to
+ * `new Date(sec * 1000).toISOString()` with the millisecond part stripped, for any second the
+ * logical clock can reach; it just avoids a Date allocation and a regex per timestamp.
+ */
+function isoFromEpochSec(totalSec: number): string {
+  const days = Math.floor(totalSec / 86400);
+  let rem = totalSec - days * 86400;
+  const hh = Math.floor(rem / 3600);
+  rem -= hh * 3600;
+  const mm = Math.floor(rem / 60);
+  const ss = rem - mm * 60;
+  const z = days + 719468;
+  const era = Math.floor(z / 146097);
+  const doe = z - era * 146097;
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+  const y = yoe + era * 400;
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
+  const mp = Math.floor((5 * doy + 2) / 153);
+  const dd = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  const mo = mp < 10 ? mp + 3 : mp - 9;
+  const yr = mo <= 2 ? y + 1 : y;
+  const p2 = (n: number): string => (n < 10 ? `0${n}` : String(n));
+  return `${String(yr).padStart(4, '0')}-${p2(mo)}-${p2(dd)}T${p2(hh)}:${p2(mm)}:${p2(ss)}Z`;
 }
 
 export function objectTypeOf(forge: Forge, sha: string): GitObjectType | undefined {

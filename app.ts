@@ -31,9 +31,13 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+  sendText(res, status, `${JSON.stringify(body)}\n`, headers);
+}
+
+function sendText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
+  const buf = Buffer.from(text, 'utf8');
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length, ...headers });
+  res.end(buf);
 }
 
 function sendEmpty(res: ServerResponse, status: number): void {
@@ -95,10 +99,32 @@ function paginate<T>(req: IncomingMessage, url: URL, items: readonly T[]): Page<
 
 // ---------------------------------------------------------------- JSON shapes
 
+/** Node ids derive from immutable ids, so each is computed once per object. */
+const repoNodeIds = new WeakMap<Repo, string>();
+const issueNodeIds = new WeakMap<Issue, string>();
+
+function repoNodeIdOf(repo: Repo): string {
+  let id = repoNodeIds.get(repo);
+  if (id === undefined) {
+    id = nodeId('Repository', [repo.id]);
+    repoNodeIds.set(repo, id);
+  }
+  return id;
+}
+
+function issueNodeIdOf(repo: Repo, issue: Issue): string {
+  let id = issueNodeIds.get(issue);
+  if (id === undefined) {
+    id = nodeId('Issue', [repo.id, issue.number]);
+    issueNodeIds.set(issue, id);
+  }
+  return id;
+}
+
 function repoJson(repo: Repo): Record<string, unknown> {
   return {
     id: repo.id,
-    node_id: nodeId('Repository', [repo.id]),
+    node_id: repoNodeIdOf(repo),
     name: repo.name,
     full_name: `${repo.owner}/${repo.name}`,
     owner: { login: repo.owner, id: VIEWER.id },
@@ -114,7 +140,7 @@ function repoJson(repo: Repo): Record<string, unknown> {
 function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   return {
     id: repo.id * 1_000_000 + issue.number,
-    node_id: nodeId('Issue', [repo.id, issue.number]),
+    node_id: issueNodeIdOf(repo, issue),
     number: issue.number,
     title: issue.title,
     body: issue.body,
@@ -125,6 +151,32 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     created_at: issue.createdAt,
     updated_at: issue.updatedAt,
   };
+}
+
+/**
+ * The serialised single-issue reply, cached per issue. The fingerprint covers every mutable
+ * input of issueJson (title, body, state, label names and their colours, comment count and
+ * updated_at; the rest derives from immutable ids), so a cached body is served only while it
+ * is byte-for-byte what a fresh serialisation would produce.
+ */
+const issueTextCache = new WeakMap<Issue, { fp: string; text: string }>();
+
+function issueFingerprint(repo: Repo, issue: Issue): string {
+  let fp = `${issue.title}\0${issue.body}\0${issue.state}\0${issue.comments.length}\0${issue.updatedAt}`;
+  for (const name of issue.labels) fp += `\0${name}:${repo.labels.get(name)?.color ?? 'ededed'}`;
+  return fp;
+}
+
+function sendIssueJson(res: ServerResponse, repo: Repo, issue: Issue): void {
+  const fp = issueFingerprint(repo, issue);
+  const hit = issueTextCache.get(issue);
+  if (hit !== undefined && hit.fp === fp) {
+    sendText(res, 200, hit.text);
+    return;
+  }
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  issueTextCache.set(issue, { fp, text });
+  sendText(res, 200, text);
 }
 
 function pullJson(forge: Forge, repo: Repo, pull: Pull): Record<string, unknown> {
@@ -380,6 +432,7 @@ async function handleRepoRoutes(
       if (ref === '' || obj === undefined) throw new HttpError(422, 'Validation Failed: object does not exist');
       if (repo.refs.has(ref)) throw new HttpError(422, 'Reference already exists');
       repo.refs.set(ref, sha);
+      repo.refsVersion += 1;
       sendJson(res, 201, { ref, object: { sha, type: obj.type } });
       return;
     }
@@ -628,7 +681,7 @@ async function handleIssues(
 
   if (tail.length === 1) {
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
+      sendIssueJson(res, repo, issue);
       return;
     }
     if (method === 'PATCH') {

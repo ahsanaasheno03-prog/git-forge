@@ -20,7 +20,7 @@ export function sha1Hex(data: Buffer): string {
 
 export function objectId(type: GitObjectType, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 /** An in-memory object database. */
@@ -385,7 +385,9 @@ export function buildPack(objects: readonly GitObject[]): Buffer {
       bytes.push(first);
     }
     parts.push(Buffer.from(bytes));
-    parts.push(deflateSync(obj.data));
+    // Level 1: any zlib level is a valid pack stream, and the small objects a fetch serves
+    // deflate several times faster here than at the default level for a few bytes more.
+    parts.push(deflateSync(obj.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();

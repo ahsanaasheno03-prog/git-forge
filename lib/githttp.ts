@@ -72,6 +72,38 @@ function sendBuffer(res: ServerResponse, status: number, contentType: string, bo
   res.end(body);
 }
 
+// ---------------------------------------------------------------- response caches
+//
+// Git objects are immutable and content-addressed, so several replies are pure functions of
+// data that cannot change underneath them: a fetch reply is fixed once every want/have/shallow
+// it names exists in the store (their closures live inside those immutable objects), and the
+// advertisements and ls-refs replies are fixed by the repo's refs (refsVersion) plus the store's
+// contents (objectsVersion — a tag peels only once its target object has arrived).
+// Caching those bytes changes no reply's content — only how often it is rebuilt.
+
+interface RepoHttpCache {
+  adv: Map<string, Buffer>;
+  ls: Map<string, Buffer>;
+  fetch: Map<string, Buffer>;
+}
+
+const httpCaches = new WeakMap<Repo, RepoHttpCache>();
+const CACHE_MAX = 256;
+
+function httpCache(repo: Repo): RepoHttpCache {
+  let cache = httpCaches.get(repo);
+  if (cache === undefined) {
+    cache = { adv: new Map(), ls: new Map(), fetch: new Map() };
+    httpCaches.set(repo, cache);
+  }
+  return cache;
+}
+
+function cachePut(map: Map<string, Buffer>, key: string, value: Buffer): void {
+  if (map.size >= CACHE_MAX) map.clear();
+  map.set(key, value);
+}
+
 /** The commit a tag object (chain) points at, or null. */
 function peelToCommit(forge: Forge, sha: string): string | null {
   let current = sha;
@@ -126,18 +158,39 @@ function advertisementV0(forge: Forge, repo: Repo, service: string): Buffer {
   return Buffer.concat(parts);
 }
 
-function advertisementV2(): Buffer {
-  const parts: Buffer[] = [
-    pktLine('# service=git-upload-pack\n'),
-    PKT_FLUSH,
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ];
-  return Buffer.concat(parts);
+/** The v2 advertisement never changes; build it once. */
+const ADV_V2: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
+function cachedAdvertisementV0(forge: Forge, repo: Repo, service: string): Buffer {
+  const cache = httpCache(repo);
+  // Both versions belong in the key: refsVersion tracks the refs themselves, and objectsVersion
+  // tracks stored objects — a tag's peeled line appears once its target object has arrived,
+  // which a pack can deliver without moving any ref.
+  const key = `${service}|${repo.refsVersion}|${forge.objectsVersion}`;
+  const hit = cache.adv.get(key);
+  if (hit !== undefined) return hit;
+  const body = advertisementV0(forge, repo, service);
+  cachePut(cache.adv, key, body);
+  return body;
+}
+
+function cachedLsRefs(forge: Forge, repo: Repo, args: readonly string[]): Buffer {
+  const cache = httpCache(repo);
+  const key = `${repo.refsVersion}|${forge.objectsVersion}|${args.join('\n')}`;
+  const hit = cache.ls.get(key);
+  if (hit !== undefined) return hit;
+  const body = lsRefs(forge, repo, args);
+  cachePut(cache.ls, key, body);
+  return body;
 }
 
 // ---------------------------------------------------------------- ls-refs
@@ -262,7 +315,26 @@ function computeFetch(forge: Forge, req: FetchRequest): { objects: GitObject[]; 
 }
 
 function fetchResponse(forge: Forge, repo: Repo, req: FetchRequest, version2: boolean): Buffer {
-  void repo;
+  // Cacheable only when every object the request names is already in the store: from then on
+  // the reply is a pure function of those immutable objects (see the cache note above).
+  const cacheable =
+    req.wants.every((sha) => forge.store.has(sha)) &&
+    req.haves.every((sha) => forge.store.has(sha)) &&
+    req.shallow.every((sha) => forge.store.has(sha));
+  const cache = httpCache(repo);
+  const key = cacheable
+    ? `${version2 ? '2' : '0'}|${req.wants.join(',')}|${req.haves.join(',')}|${req.shallow.join(',')}|${req.deepen ?? ''}`
+    : null;
+  if (key !== null) {
+    const hit = cache.fetch.get(key);
+    if (hit !== undefined) return hit;
+  }
+  const body = fetchResponseFresh(forge, req, version2);
+  if (key !== null) cachePut(cache.fetch, key, body);
+  return body;
+}
+
+function fetchResponseFresh(forge: Forge, req: FetchRequest, version2: boolean): Buffer {
   const { objects, shallowLines } = computeFetch(forge, req);
   const pack = buildPack(objects);
   if (!version2) {
@@ -334,6 +406,7 @@ function receivePack(forge: Forge, repo: Repo, body: Buffer): Buffer {
     try {
       const { objects } = parsePack(packBytes, forge.store);
       for (const obj of objects) forge.store.putKnown(obj.sha, obj.type, obj.data);
+      if (objects.length > 0) forge.objectsVersion += 1;
     } catch (err) {
       unpackOk = false;
       unpackLine = `unpack ${err instanceof Error ? err.message : String(err)}\n`;
@@ -359,7 +432,7 @@ function receivePack(forge: Forge, repo: Repo, body: Buffer): Buffer {
 function applyRefUpdate(forge: Forge, repo: Repo, command: RefCommand): string | null {
   const { oldSha, newSha, ref } = command;
   if (newSha === ZERO_SHA) {
-    repo.refs.delete(ref);
+    if (repo.refs.delete(ref)) repo.refsVersion += 1;
     return null;
   }
   const obj = forge.store.get(newSha);
@@ -371,6 +444,7 @@ function applyRefUpdate(forge: Forge, repo: Repo, command: RefCommand): string |
     if (!forge.isAncestor(current, newSha)) return 'non-fast-forward';
   }
   repo.refs.set(ref, newSha);
+  repo.refsVersion += 1;
   return null;
 }
 
@@ -399,7 +473,7 @@ export async function handleGitRequest(
     }
     const protocol = req.headers['git-protocol'];
     const wantsV2 = service === 'git-upload-pack' && typeof protocol === 'string' && protocol.includes('version=2');
-    const body = wantsV2 ? advertisementV2() : advertisementV0(forge, repo, service);
+    const body = wantsV2 ? ADV_V2 : cachedAdvertisementV0(forge, repo, service);
     sendBuffer(res, 200, `application/x-${service}-advertisement`, body);
     return;
   }
@@ -413,7 +487,7 @@ export async function handleGitRequest(
       const argLines = (delimIndex >= 0 ? pkts.slice(delimIndex + 1) : pkts)
         .filter((pkt) => pkt.type === 'data')
         .map((pkt) => lineText(pkt.data));
-      sendBuffer(res, 200, 'application/x-git-upload-pack-result', lsRefs(forge, repo, argLines));
+      sendBuffer(res, 200, 'application/x-git-upload-pack-result', cachedLsRefs(forge, repo, argLines));
       return;
     }
     if (first.startsWith('command=fetch')) {
