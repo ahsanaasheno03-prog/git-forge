@@ -9,6 +9,7 @@ import {
   parsePack,
   parseCommit,
   pktLine,
+  pktPrefix,
   PKT_FLUSH,
   type GitObject,
 } from './git.ts';
@@ -57,13 +58,15 @@ function lineText(data: Buffer): string {
 
 /** Frame a byte stream as sideband-64k pkt-lines on band 1. */
 function sidebandFrames(data: Buffer, band = 1): Buffer {
+  const bandByte = Buffer.from([band]);
   const parts: Buffer[] = [];
   const CHUNK = 65515;
   for (let offset = 0; offset < data.length; offset += CHUNK) {
     const chunk = data.subarray(offset, offset + CHUNK);
-    parts.push(pktLine(Buffer.concat([Buffer.from([band]), chunk])));
+    // One concat per frame (prefix + band byte + chunk) instead of framing an inner copy.
+    parts.push(Buffer.concat([pktPrefix(chunk.length + 5), bandByte, chunk]));
   }
-  if (data.length === 0) parts.push(pktLine(Buffer.from([band])));
+  if (data.length === 0) parts.push(pktLine(bandByte));
   return Buffer.concat(parts);
 }
 

@@ -25,7 +25,7 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -37,6 +37,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
 function sendText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
   const buf = Buffer.from(text, 'utf8');
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length, ...headers });
+  res.end(buf);
+}
+
+function sendBufferJson(res: ServerResponse, status: number, buf: Buffer): void {
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length });
   res.end(buf);
 }
 
@@ -159,7 +164,7 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
  * updated_at; the rest derives from immutable ids), so a cached body is served only while it
  * is byte-for-byte what a fresh serialisation would produce.
  */
-const issueTextCache = new WeakMap<Issue, { fp: string; text: string }>();
+const issueTextCache = new WeakMap<Issue, { fp: string; buf: Buffer }>();
 
 function issueFingerprint(repo: Repo, issue: Issue): string {
   let fp = `${issue.title}\0${issue.body}\0${issue.state}\0${issue.comments.length}\0${issue.updatedAt}`;
@@ -171,12 +176,12 @@ function sendIssueJson(res: ServerResponse, repo: Repo, issue: Issue): void {
   const fp = issueFingerprint(repo, issue);
   const hit = issueTextCache.get(issue);
   if (hit !== undefined && hit.fp === fp) {
-    sendText(res, 200, hit.text);
+    sendBufferJson(res, 200, hit.buf);
     return;
   }
-  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
-  issueTextCache.set(issue, { fp, text });
-  sendText(res, 200, text);
+  const buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issueTextCache.set(issue, { fp, buf });
+  sendBufferJson(res, 200, buf);
 }
 
 function pullJson(forge: Forge, repo: Repo, pull: Pull): Record<string, unknown> {
@@ -243,6 +248,46 @@ async function handle(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
+  // Fast paths for the two hottest REST shapes (single-issue read, issue create). Taken only
+  // when the raw URL carries no '%' and no query string, so each segment is exactly what the
+  // general path's decodeURIComponent would produce; the auth check, lookups, statuses, error
+  // messages and reply builders below are the general path's own, in the same order.
+  const rawUrl = req.url ?? '';
+  if (!rawUrl.includes('%') && !rawUrl.includes('?')) {
+    const fastMethod = req.method ?? 'GET';
+    if (fastMethod === 'GET') {
+      const match = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/([0-9]+)$/.exec(rawUrl);
+      if (match !== null) {
+        if (!authed(req)) throw new HttpError(401, 'Requires authentication');
+        const owner = match[1] as string;
+        const repo = owner === VIEWER.login ? forge.getRepo(owner, match[2] as string) : undefined;
+        if (repo === undefined) throw new HttpError(404, 'Not Found');
+        const issue = repo.issues.get(Number(match[3] as string));
+        if (issue === undefined) throw new HttpError(404, 'Not Found');
+        sendIssueJson(res, repo, issue);
+        return;
+      }
+    } else if (fastMethod === 'POST') {
+      const match = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues$/.exec(rawUrl);
+      if (match !== null) {
+        if (!authed(req)) throw new HttpError(401, 'Requires authentication');
+        const owner = match[1] as string;
+        const repo = owner === VIEWER.login ? forge.getRepo(owner, match[2] as string) : undefined;
+        if (repo === undefined) throw new HttpError(404, 'Not Found');
+        const body = await jsonBody(req);
+        const title = typeof body.title === 'string' ? body.title : '';
+        if (title === '') throw new HttpError(422, 'Validation Failed: title is required');
+        const labels = Array.isArray(body.labels) ? body.labels.map((label) => String(label)) : [];
+        for (const label of labels) {
+          if (!repo.labels.has(label)) throw new HttpError(422, `Validation Failed: label '${label}' does not exist`);
+        }
+        const issue = forge.createIssue(repo, title, typeof body.body === 'string' ? body.body : '', labels);
+        sendJson(res, 201, issueJson(repo, issue));
+        return;
+      }
+    }
+  }
+
   const url = new URL(req.url ?? '/', 'http://entry');
   const path = url.pathname;
   const method = req.method ?? 'GET';

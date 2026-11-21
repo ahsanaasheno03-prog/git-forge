@@ -396,13 +396,23 @@ export function buildPack(objects: readonly GitObject[]): Buffer {
 
 // ---------------------------------------------------------------- pkt-lines
 
+/** The 4-hex length prefix for a pkt-line of `len` bytes, built once per length and reused. */
+const pktPrefixes: (Buffer | undefined)[] = [];
+
+export function pktPrefix(len: number): Buffer {
+  let prefix = pktPrefixes[len];
+  if (prefix === undefined) {
+    prefix = Buffer.from(len.toString(16).padStart(4, '0'), 'latin1');
+    pktPrefixes[len] = prefix;
+  }
+  return prefix;
+}
+
 /** Encode one pkt-line (4-hex length prefix including itself). Empty string encodes a flush packet. */
 export function pktLine(payload: string | Buffer): Buffer {
   if (payload.length === 0) return Buffer.from('0000', 'latin1');
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const len = body.length + 4;
-  const prefix = Buffer.from(len.toString(16).padStart(4, '0'), 'latin1');
-  return Buffer.concat([prefix, body]);
+  return Buffer.concat([pktPrefix(body.length + 4), body]);
 }
 
 export const PKT_FLUSH = Buffer.from('0000', 'latin1');

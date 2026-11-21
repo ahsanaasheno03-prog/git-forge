@@ -233,7 +233,7 @@ export class Forge {
       if (seen.has(sha)) continue;
       seen.add(sha);
       const obj = this.store.get(sha);
-      if (obj !== undefined && obj.type === 'commit') stack.push(...parseCommit(obj.data).parents);
+      if (obj !== undefined && obj.type === 'commit') stack.push(...commitParents(obj.data));
     }
     return false;
   }
@@ -482,6 +482,28 @@ export class Forge {
     if (lines[lines.length - 1] === '') lines.pop();
     return lines;
   }
+}
+
+/**
+ * The parent ids of a commit object, read by scanning its header lines in place — the same
+ * result as parseCommit(data).parents (the header is every line before the blank line, or the
+ * whole payload when there is none; a parent line is `parent ` + id at a line start), without
+ * decoding and splitting the whole header on the receive-pack hot path.
+ */
+function commitParents(data: Buffer): string[] {
+  const parents: string[] = [];
+  let headerEnd = data.indexOf('\n\n');
+  if (headerEnd === -1) headerEnd = data.length;
+  let pos = 0;
+  while (pos < headerEnd) {
+    let lineEnd = data.indexOf(0x0a, pos);
+    if (lineEnd === -1 || lineEnd > headerEnd) lineEnd = headerEnd;
+    if (lineEnd - pos > 7 && data.toString('latin1', pos, pos + 7) === 'parent ') {
+      parents.push(data.toString('latin1', pos + 7, lineEnd).trim());
+    }
+    pos = lineEnd + 1;
+  }
+  return parents;
 }
 
 /** Count added/removed lines between two line arrays via a simple LCS dynamic program. */
